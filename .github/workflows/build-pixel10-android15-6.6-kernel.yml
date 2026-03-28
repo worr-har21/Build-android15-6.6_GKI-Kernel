@@ -11,7 +11,172 @@ on:
 	  build_script:
 		description: Build script at repo root (e.g. ./build_frankel.sh or ./build_caimito.sh)
 		required: true
+		type: string name: Build Pixel kernel (android15-6.6 / GKI)
+
+on:
+  workflow_dispatch:
+	inputs:
+	  manifest_branch:
+		description: kernel/manifest branch (device tree for your Pixel / GKI combo)
+		required: true
 		type: string
+		default: android-gs-frankel-6.6-android16
+	  build_script:
+		description: Build script at repo root (e.g. ./build_frankel.sh or ./build_caimito.sh)
+		required: true
+		type: string
+		default: ./build_frankel.sh
+	  common_ref:
+		description: Optional — git ref to checkout inside `common` after sync (tag, branch, or SHA)
+		required: false
+		type: string
+		default: ""
+	  build_aosp_kernel:
+		description: Set to true to compile the full GKI from sources (BUILD_AOSP_KERNEL=1)
+		required: false
+		type: boolean
+		default: true
+	  sync_jobs:
+		description: Parallel jobs for repo sync (-j)
+		required: false
+		type: string
+		default: "4"
+	  integrate_sukisu_driver:
+		description: Clone SukiSU-Ultra and install drivers/kernelsu/ + Kconfig/Makefile hooks
+		required: false
+		type: boolean
+		default: true
+	  sukisu_ref:
+		description: SukiSU-Ultra git branch, tag, or SHA
+		required: false
+		type: string
+		default: main
+	  apply_kconfig_fragment:
+		description: Merge kernel-configs fragment into GKI defconfig (LXC + SukiSU options)
+		required: false
+		type: boolean
+		default: true
+	  kconfig_fragment:
+		description: Path under the workflow repo to the fragment file
+		required: false
+		type: string
+		default: kernel-configs/lxc-container.fragment
+	  gki_defconfig_path:
+		description: Path under kernel/common to the arm64 GKI defconfig
+		required: false
+		type: string
+		default: arch/arm64/configs/gki_defconfig
+
+concurrency:
+  group: pixel-kernel-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+	runs-on: ubuntu-latest
+	timeout-minutes: 720
+	env:
+	  REPO_URL: https://android.googlesource.com/kernel/manifest
+	  SYNC_JOBS: ${{ github.event.inputs.sync_jobs }}
+	  KERNEL_ROOT: ${{ runner.temp }}/kernel
+	  COMMON_DIR: ${{ runner.temp }}/kernel/common
+
+	steps:
+	  - name: Checkout workflow repo (scripts + kconfig fragments)
+		uses: actions/checkout@v4
+
+	  - name: Free disk space
+		uses: easimon/maximize-build-space@v10
+		with:
+		  root-reserve-mb: 512
+		  swap-size-mb: 1024
+		  remove-dotnet: "true"
+		  remove-android: "true"
+		  remove-haskell: "true"
+		  remove-codeql: "true"
+
+	  - name: Install host packages
+		run: |
+		  sudo apt-get update -qq
+		  sudo apt-get install -y --no-install-recommends \
+			bc bison build-essential ccache curl flex \
+			git gnupg gperf liblz4-tool libssl-dev libxml2-utils \
+			lzop make python3 python3-venv rsync unzip zip \
+			zlib1g-dev libncurses-dev \
+			default-jdk-headless
+
+	  - name: Install repo
+		run: |
+		  sudo curl -fsSL -o /usr/local/bin/repo https://storage.googleapis.com/git-repo-downloads/repo
+		  sudo chmod a+x /usr/local/bin/repo
+
+	  - name: Configure git (repo)
+		run: |
+		  git config --global user.email "you@example.com"
+		  git config --global user.name "Kernel CI"
+		  git config --global color.ui false
+
+	  - name: Make helper scripts executable
+		run: chmod +x "${GITHUB_WORKSPACE}/scripts/merge-kconfig-fragment.sh" "${GITHUB_WORKSPACE}/scripts/integrate-sukisu-driver.sh"
+
+	  - name: repo init & sync
+		run: |
+		  mkdir -p "${KERNEL_ROOT}"
+		  cd "${KERNEL_ROOT}"
+		  repo init -u "${REPO_URL}" -b "${{ github.event.inputs.manifest_branch }}"
+		  repo sync -c --no-tags -j"${SYNC_JOBS}" --fail-fast
+
+	  - name: Optionally pin kernel/common
+		if: ${{ github.event.inputs.common_ref != '' }}
+		working-directory: ${{ env.KERNEL_ROOT }}/common
+		run: |
+		  git fetch origin "${{ github.event.inputs.common_ref }}" || true
+		  git checkout "${{ github.event.inputs.common_ref }}"
+
+	  - name: Integrate SukiSU driver (SukiSU-Ultra)
+		if: ${{ github.event.inputs.integrate_sukisu_driver == true || github.event.inputs.integrate_sukisu_driver == 'true' }}
+		run: |
+		  "${GITHUB_WORKSPACE}/scripts/integrate-sukisu-driver.sh" "${COMMON_DIR}" "${{ github.event.inputs.sukisu_ref }}"
+
+	  - name: Merge LXC / SukiSU kconfig fragment
+		if: ${{ github.event.inputs.apply_kconfig_fragment == true || github.event.inputs.apply_kconfig_fragment == 'true' }}
+		run: |
+		  FRAG="${GITHUB_WORKSPACE}/${{ github.event.inputs.kconfig_fragment }}"
+		  "${GITHUB_WORKSPACE}/scripts/merge-kconfig-fragment.sh" "${COMMON_DIR}" "$FRAG" "${{ github.event.inputs.gki_defconfig_path }}"
+
+	  - name: Build (Kleaf / build_*.sh)
+		working-directory: ${{ env.KERNEL_ROOT }}
+		run: |
+		  set -eux
+		  BUILD_INPUT="${{ github.event.inputs.build_aosp_kernel }}"
+		  if [ "${BUILD_INPUT}" = "true" ] || [ "${BUILD_INPUT}" = "True" ]; then
+			export BUILD_AOSP_KERNEL=1
+		  else
+			export BUILD_AOSP_KERNEL=0
+		  fi
+		  BS="${{ github.event.inputs.build_script }}"
+		  if [ ! -x "$BS" ] && [ -f "$BS" ]; then chmod +x "$BS"; fi
+		  "$BS"
+
+	  - name: Upload distribution images
+		uses: actions/upload-artifact@v4
+		with:
+		  name: kernel-dist-${{ github.run_id }}
+		  path: |
+			${{ env.KERNEL_ROOT }}/out/*/dist/**
+		  if-no-files-found: warn
+
+	  - name: Show kernel release string (if tree present)
+		if: always()
+		working-directory: ${{ env.KERNEL_ROOT }}/common
+		run: |
+		  if [ -f Makefile ]; then
+			make kernelrelease 2>/dev/null | head -1 || true
+			grep -E '^VERSION |^PATCHLEVEL |^SUBLEVEL ' Makefile | head -3 || true
+		  fi
 		default: ./build_frankel.sh
 	  common_ref:
 		description: Optional — git ref to checkout inside `common` after sync (tag, branch, or SHA)
