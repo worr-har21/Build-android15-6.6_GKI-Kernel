@@ -110,6 +110,9 @@ jobs:
           git config --global user.name "Kernel CI"
           git config --global color.ui false
 
+      - name: Debug - list all downloaded files
+        run: ls -laR
+
       - name: Make helper scripts executable
         run: chmod +x "${GITHUB_WORKSPACE}/scripts/merge-kconfig-fragment.sh" "${GITHUB_WORKSPACE}/scripts/integrate-sukisu-driver.sh"
 
